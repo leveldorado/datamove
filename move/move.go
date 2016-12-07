@@ -1,6 +1,8 @@
 package move
 
 import (
+	"fmt"
+
 	"gopkg.in/mgo.v2"
 	"gopkg.in/mgo.v2/bson"
 )
@@ -14,70 +16,73 @@ func NewMover(source, target *mgo.Session) *Mover {
 	return &Mover{source: source, target: target}
 }
 
-func (m *Mover) MoveCollection(database, collection string) chan error {
-	ch := make(chan error, 1)
-	go func() {
-		sourceCol := m.source.Copy().DB(database).C(collection)
-		defer sourceCol.Database.Session.Close()
-		targetCol := m.target.Copy().DB(database).C(collection)
-		defer targetCol.Database.Session.Close()
+func (m *Mover) MoveCollection(database, collection string, errChan chan error) {
+	//skip admin system.version
+	if database == "admin" && collection == "system.version" {
+		errChan <- nil
+		return
+	}
 
-		iter := sourceCol.Find(bson.M{}).Iter()
-		doc := bson.M{}
-		for iter.Next(&doc) {
-			if err := targetCol.Insert(doc); err != nil {
-				iter.Close()
-				ch <- err
-				return
-			}
-			doc = bson.M{}
-		}
-		ch <- iter.Close()
-		close(ch)
-	}()
-	return ch
-}
+	sourceCol := m.source.Copy().DB(database).C(collection)
+	defer sourceCol.Database.Session.Close()
+	targetCol := m.target.Copy().DB(database).C(collection)
+	defer targetCol.Database.Session.Close()
 
-func (m *Mover) MoveDatabase(database string) chan error {
-	ch := make(chan error, 1)
-	go func() {
-		db := m.source.DB(database)
-		collections, err := db.CollectionNames()
-		if err != nil {
-			ch <- err
-			close(ch)
+	counter := 0
+
+	iter := sourceCol.Find(bson.M{}).Iter()
+	doc := bson.M{}
+	for iter.Next(&doc) {
+		if err := targetCol.Insert(doc); err != nil {
+			iter.Close()
+			errChan <- err
 			return
 		}
-		chansList := make([]chan error, len(collections))
-		for _, col := range collections {
-			chansList = append(chansList, m.MoveCollection(database, col))
-		}
-		for _, v := range chansList {
-			if err := <-v; err != nil {
-				ch <- err
-			}
-		}
-		ch <- nil
-		close(ch)
-	}()
-	return ch
+		doc = bson.M{}
+		counter++
+	}
+	if err := iter.Close(); err != nil {
+		errChan <- err
+		return
+	}
+	errChan <- nil
+	fmt.Println("COPIED docs:", counter, "database:", database, "collection:", collection)
 }
 
-func (m *Mover) MoveDatabases(databases []string) chan error {
-	ch := make(chan error, 1)
+func (m *Mover) MoveDatabase(database string, errChan chan error, endChan chan struct{}) {
+	db := m.source.DB(database)
+	collections, err := db.CollectionNames()
+	if err != nil {
+		errChan <- err
+		return
+	}
+	collectionMoveErrChan := make(chan error, len(collections))
+	for _, col := range collections {
+		go m.MoveCollection(database, col, collectionMoveErrChan)
+	}
+
+	for i := 0; i < len(collections); i++ {
+		if err := <-collectionMoveErrChan; err != nil {
+			errChan <- err
+		}
+	}
+	close(collectionMoveErrChan)
+	fmt.Println("MOVED database", database)
+	endChan <- struct{}{}
+}
+
+func (m *Mover) MoveDatabases(databases []string) (errorOutput chan error) {
+	ch := make(chan error, len(databases))
+	endChan := make(chan struct{}, len(databases))
 	go func() {
-		chansList := make([]chan error, len(databases))
 		for _, v := range databases {
-			chansList = append(chansList, m.MoveDatabase(v))
+			go m.MoveDatabase(v, ch, endChan)
 		}
-		for _, c := range chansList {
-			for err := range c {
-				if err != nil {
-					ch <- err
-				}
-			}
+	}()
+	go func() {
+		for i := 0; i < len(databases); i++ {
+			_ = <-endChan
 		}
-		ch <- nil
 		close(ch)
 	}()
 	return ch
