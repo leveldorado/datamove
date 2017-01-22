@@ -49,7 +49,7 @@ func (m *Mover) MoveCollection(database, collection string, errChan chan error) 
 	fmt.Println("COPIED docs:", counter, "database:", database, "collection:", collection)
 }
 
-func (m *Mover) MoveDatabase(database string, errChan chan error, endChan chan struct{}) {
+func (m *Mover) MoveDatabase(database string, errChan chan error, endChan chan struct{}, collectionMap map[string]bool) {
 	db := m.source.DB(database)
 	collections, err := db.CollectionNames()
 	if err != nil {
@@ -58,6 +58,9 @@ func (m *Mover) MoveDatabase(database string, errChan chan error, endChan chan s
 	}
 	collectionMoveErrChan := make(chan error, len(collections))
 	for _, col := range collections {
+		if len(collectionMap) != 0 && !collectionMap[col] {
+			continue
+		}
 		go m.MoveCollection(database, col, collectionMoveErrChan)
 	}
 
@@ -71,12 +74,12 @@ func (m *Mover) MoveDatabase(database string, errChan chan error, endChan chan s
 	endChan <- struct{}{}
 }
 
-func (m *Mover) MoveDatabases(databases []string) (errorOutput chan error) {
+func (m *Mover) MoveDatabases(databases []string, collections map[string]bool) (errorOutput chan error) {
 	ch := make(chan error, len(databases))
 	endChan := make(chan struct{}, len(databases))
 	go func() {
 		for _, v := range databases {
-			go m.MoveDatabase(v, ch, endChan)
+			go m.MoveDatabase(v, ch, endChan, collections)
 		}
 	}()
 	go func() {
@@ -88,7 +91,7 @@ func (m *Mover) MoveDatabases(databases []string) (errorOutput chan error) {
 	return ch
 }
 
-func (m *Mover) MoveAllDatabases() chan error {
+func (m *Mover) MoveAllDatabases(collections map[string]bool) chan error {
 	databases, err := m.source.DatabaseNames()
 	if err != nil {
 		ch := make(chan error, 1)
@@ -96,5 +99,5 @@ func (m *Mover) MoveAllDatabases() chan error {
 		close(ch)
 		return ch
 	}
-	return m.MoveDatabases(databases)
+	return m.MoveDatabases(databases, collections)
 }
